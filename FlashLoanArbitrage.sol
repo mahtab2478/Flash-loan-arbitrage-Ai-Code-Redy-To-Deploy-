@@ -31,6 +31,7 @@ contract SecurePolygonArbitrage is FlashLoanSimpleReceiverBase, ReentrancyGuard,
         address router;
         uint24 poolFee;
         bool enabled;
+        string name;
     }
 
     struct ArbitragePath {
@@ -40,19 +41,19 @@ contract SecurePolygonArbitrage is FlashLoanSimpleReceiverBase, ReentrancyGuard,
         uint256 dexFee;
     }
 
-    // Token Addresses (Polygon Mainnet)
-    address public constant USDC = 0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174;
-    address public constant WETH = 0x7ceB23fD6bC0adD59E62ac25578270cFf1b9f619;
-    address public constant DAI = 0x8f3Cf7ad23Cd3CaDbD9735AFf958023239c6A063;
+    // Default Token Addresses (Polygon Mainnet)
+    address public USDC;
+    address public WETH;
+    address public DAI;
 
     // Configuration
-    uint256 public minProfitThreshold = 1500 * 1e6;
-    uint256 public slippageTolerance = 50;
-    uint256 public feePercentage = 5;
-    address public constant PROFIT_WALLET = 0x519212b1De291E2C55f223aB23D69e895d08545b;
-    uint256 public maxLoanAmount = 1_000_000 * 1e6;
-    uint256 public deadlineExtension = 30 minutes;
-    bool public usePrivateRPC = true;
+    uint256 public minProfitThreshold;
+    uint256 public slippageTolerance; // in basis points (1/100th of 1%)
+    uint256 public feePercentage; // in basis points (1/100th of 1%)
+    address public profitWallet;
+    uint256 public maxLoanAmount;
+    uint256 public deadlineExtension;
+    bool public usePrivateRPC;
     
     // DEX Configurations
     mapping(address => DexConfig) public dexConfigurations;
@@ -61,7 +62,7 @@ contract SecurePolygonArbitrage is FlashLoanSimpleReceiverBase, ReentrancyGuard,
     // State
     bool public circuitBreakerActive;
     uint256 public lastExecutionTime;
-    uint256 public cooldownPeriod = 5 minutes;
+    uint256 public cooldownPeriod;
     mapping(address => bool) public approvedTokens;
     mapping(address => uint256) public tokenMinProfits;
 
@@ -70,26 +71,54 @@ contract SecurePolygonArbitrage is FlashLoanSimpleReceiverBase, ReentrancyGuard,
     event CircuitBreakerTriggered(bool active);
     event SlippageExceeded(uint256 expected, uint256 actual);
     event LiquidityCheckFailed(address dex, address token);
-    event DexAdded(address indexed router, uint24 fee, bool enabled);
+    event DexAdded(address indexed router, uint24 fee, bool enabled, string name);
     event DexUpdated(address indexed router, bool enabled);
     event PrivateRPCToggled(bool enabled);
     event SlippageUpdated(uint256 newTolerance);
     event MinProfitThresholdUpdated(uint256 newThreshold);
+    event TokenAdded(address indexed token, uint256 minProfit);
+    event TokenRemoved(address indexed token);
+    event ProfitWalletUpdated(address newWallet);
+    event MaxLoanAmountUpdated(uint256 newAmount);
+    event CooldownUpdated(uint256 newCooldown);
+    event DeadlineExtensionUpdated(uint256 newExtension);
 
-    constructor(IPoolAddressesProvider provider) FlashLoanSimpleReceiverBase(provider) Ownable(msg.sender) {
-        // Initialize approved tokens
-        approvedTokens[USDC] = true;
-        approvedTokens[WETH] = true;
-        approvedTokens[DAI] = true;
+    constructor(
+        IPoolAddressesProvider provider,
+        address _usdc,
+        address _weth,
+        address _dai,
+        address _profitWallet,
+        uint256 _initialMinProfit,
+        uint256 _initialSlippage,
+        uint256 _initialFee,
+        uint256 _initialMaxLoan,
+        uint256 _initialCooldown,
+        uint256 _initialDeadlineExtension
+    ) FlashLoanSimpleReceiverBase(provider) Ownable(msg.sender) {
+        require(_profitWallet != address(0), "Profit wallet cannot be zero");
+        require(_initialSlippage <= 500, "Slippage too high"); // Max 5%
+        require(_initialFee <= 1000, "Fee too high"); // Max 10%
         
-        // Set minimum profits
-        tokenMinProfits[USDC] = minProfitThreshold;
-        tokenMinProfits[WETH] = 1500 * 1e18;
-        tokenMinProfits[DAI] = 1500 * 1e18;
+        // Set token addresses
+        USDC = _usdc;
+        WETH = _weth;
+        DAI = _dai;
+        
+        // Initialize configuration
+        minProfitThreshold = _initialMinProfit;
+        slippageTolerance = _initialSlippage;
+        feePercentage = _initialFee;
+        profitWallet = _profitWallet;
+        maxLoanAmount = _initialMaxLoan;
+        cooldownPeriod = _initialCooldown;
+        deadlineExtension = _initialDeadlineExtension;
+        usePrivateRPC = true;
 
-        // Initialize DEX configurations
-        _addDex(0xa5E0829CaCEd8fFDD4De3c43696c57F7D7A678ff, 3000, true); // QuickSwap
-        _addDex(0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506, 3000, true); // SushiSwap
+        // Initialize approved tokens
+        _addToken(USDC, _initialMinProfit);
+        _addToken(WETH, _initialMinProfit);
+        _addToken(DAI, _initialMinProfit);
     }
 
     modifier onlyWhenReady() {
@@ -111,6 +140,7 @@ contract SecurePolygonArbitrage is FlashLoanSimpleReceiverBase, ReentrancyGuard,
         require(approvedTokens[token], "Token not approved");
         require(amount <= maxLoanAmount, "Amount exceeds max");
         require(block.timestamp <= deadline, "Deadline passed");
+        require(paths.length > 0, "No paths provided");
         
         // Verify liquidity across all paths
         for (uint i = 0; i < paths.length; i++) {
@@ -155,9 +185,9 @@ contract SecurePolygonArbitrage is FlashLoanSimpleReceiverBase, ReentrancyGuard,
         
         // Handle profits
         if (profit > 0) {
-            uint256 fee = (profit * feePercentage) / 100;
+            uint256 fee = (profit * feePercentage) / 10000; // Using basis points
             if (fee > 0) {
-                IERC20(asset).safeTransfer(PROFIT_WALLET, fee);
+                IERC20(asset).safeTransfer(profitWallet, fee);
                 profit -= fee;
             }
             IERC20(asset).safeTransfer(owner(), profit);
@@ -203,21 +233,45 @@ contract SecurePolygonArbitrage is FlashLoanSimpleReceiverBase, ReentrancyGuard,
         }
     }
 
-    function _addDex(address router, uint24 fee, bool enabled) internal {
-        dexConfigurations[router] = DexConfig(router, fee, enabled);
+    function _addDex(address router, uint24 fee, bool enabled, string memory name) internal {
+        require(router != address(0), "Invalid router address");
+        dexConfigurations[router] = DexConfig(router, fee, enabled, name);
         supportedDexes.push(router);
-        emit DexAdded(router, fee, enabled);
+        emit DexAdded(router, fee, enabled, name);
+    }
+
+    function _addToken(address token, uint256 minProfit) internal {
+        require(token != address(0), "Invalid token address");
+        approvedTokens[token] = true;
+        tokenMinProfits[token] = minProfit;
+        emit TokenAdded(token, minProfit);
     }
 
     // ========== ADMIN FUNCTIONS ========== //
-    function addDex(address router, uint24 fee, bool enabled) external onlyOwner {
-        _addDex(router, fee, enabled);
+    function addDex(address router, uint24 fee, bool enabled, string memory name) external onlyOwner {
+        _addDex(router, fee, enabled, name);
     }
 
     function updateDex(address router, bool enabled) external onlyOwner {
         require(dexConfigurations[router].router != address(0), "DEX not found");
         dexConfigurations[router].enabled = enabled;
         emit DexUpdated(router, enabled);
+    }
+
+    function addToken(address token, uint256 minProfit) external onlyOwner {
+        _addToken(token, minProfit);
+    }
+
+    function removeToken(address token) external onlyOwner {
+        require(approvedTokens[token], "Token not approved");
+        delete approvedTokens[token];
+        delete tokenMinProfits[token];
+        emit TokenRemoved(token);
+    }
+
+    function setTokenMinProfit(address token, uint256 minProfit) external onlyOwner {
+        require(approvedTokens[token], "Token not approved");
+        tokenMinProfits[token] = minProfit;
     }
 
     function setSlippageTolerance(uint256 tolerance) external onlyOwner {
@@ -229,6 +283,32 @@ contract SecurePolygonArbitrage is FlashLoanSimpleReceiverBase, ReentrancyGuard,
     function setMinProfitThreshold(uint256 threshold) external onlyOwner {
         minProfitThreshold = threshold;
         emit MinProfitThresholdUpdated(threshold);
+    }
+
+    function setFeePercentage(uint256 fee) external onlyOwner {
+        require(fee <= 1000, "Max 10% fee allowed");
+        feePercentage = fee;
+    }
+
+    function setProfitWallet(address wallet) external onlyOwner {
+        require(wallet != address(0), "Invalid wallet address");
+        profitWallet = wallet;
+        emit ProfitWalletUpdated(wallet);
+    }
+
+    function setMaxLoanAmount(uint256 amount) external onlyOwner {
+        maxLoanAmount = amount;
+        emit MaxLoanAmountUpdated(amount);
+    }
+
+    function setCooldownPeriod(uint256 cooldown) external onlyOwner {
+        cooldownPeriod = cooldown;
+        emit CooldownUpdated(cooldown);
+    }
+
+    function setDeadlineExtension(uint256 extension) external onlyOwner {
+        deadlineExtension = extension;
+        emit DeadlineExtensionUpdated(extension);
     }
 
     function togglePrivateRPC(bool enabled) external onlyOwner {
@@ -248,6 +328,22 @@ contract SecurePolygonArbitrage is FlashLoanSimpleReceiverBase, ReentrancyGuard,
 
     function emergencyWithdraw(address token) external onlyOwner {
         IERC20(token).safeTransfer(owner(), IERC20(token).balanceOf(address(this)));
+    }
+
+    function getSupportedDexes() external view returns (DexConfig[] memory) {
+        DexConfig[] memory dexes = new DexConfig[](supportedDexes.length);
+        for (uint i = 0; i < supportedDexes.length; i++) {
+            dexes[i] = dexConfigurations[supportedDexes[i]];
+        }
+        return dexes;
+    }
+
+    function getApprovedTokens() external view returns (address[] memory) {
+        address[] memory tokens = new address[](3); // USDC, WETH, DAI by default
+        tokens[0] = USDC;
+        tokens[1] = WETH;
+        tokens[2] = DAI;
+        return tokens;
     }
 
     receive() external payable {
